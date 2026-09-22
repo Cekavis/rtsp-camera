@@ -32,6 +32,41 @@
 
 Windows 使用 `gradlew.bat`。APK 输出到 `app/build/outputs/apk/debug/app-debug.apk`。
 
+## 自动发布
+
+推送 `v*` 标签会触发 [Release 工作流](.github/workflows/release.yml)：运行现有单元测试和 Release Lint，构建经过压缩、正式签名的 APK，验证签名后创建 GitHub Release，附带 APK、SHA-256 校验文件和自动生成的更新说明。带后缀的标签（如 `v0.1.2-rc.1`）发布为预发行版。
+
+仓库需在 **Settings → Secrets and variables → Actions** 配置以下 Secrets：
+
+| Secret | 内容 |
+| --- | --- |
+| `ANDROID_KEYSTORE_BASE64` | 签名 keystore 文件的 Base64 编码 |
+| `ANDROID_KEYSTORE_PASSWORD` | keystore 密码 |
+| `ANDROID_KEY_ALIAS` | 签名密钥别名 |
+| `ANDROID_KEY_PASSWORD` | 签名密钥密码 |
+
+没有签名密钥时，可使用 JDK 自带的 `keytool` 生成。以下命令会交互式询问密码和证书信息；请把 keystore 保存在仓库之外：
+
+```sh
+keytool -genkeypair -keystore /path/outside/repo/rtsp-camera-release.keystore -storetype PKCS12 -alias rtsp-camera -keyalg RSA -keysize 4096 -sigalg SHA256withRSA -validity 10000
+```
+
+PKCS12 使用相同的 keystore 密码和密钥密码。请长期安全备份 keystore、密码及别名，后续更新沿用同一密钥。之前安装的 Debug APK 签名不同，首次切换正式版需卸载后重新安装，应用设置会丢失。
+
+发布步骤：
+
+1. 更新 `app/build.gradle.kts` 的 `versionName` 并递增 `versionCode`，提交并推送代码及工作流。
+2. 创建与 `versionName` 完全一致、带 `v` 前缀的标签。例如当前 `versionName = "0.1.1"`：
+
+   ```sh
+   git tag v0.1.1
+   git push origin v0.1.1
+   ```
+
+3. 等待 Actions 成功，在 Releases 下载 `rtsp-camera-v0.1.1.apk`。标签与 APK 版本不一致、缺少签名配置或检查失败时，工作流会终止发布。
+
+每个版本使用新标签；工作流不会覆盖已有 Release。预发行版的 `versionName` 也需包含对应后缀。
+
 ## 验证
 
 最低支持 Android 8；已在 Nothing A142 / Android 16 调试。本次音频变更通过 56 项 JVM 测试、6 项真机配置迁移与采集生命周期测试，以及 H.264 / HEVC + AAC 的 TCP / UDP 解码验证。已验证系统默认麦克风及指定内置麦克风；外接 USB、有线和蓝牙麦克风尚未实机验证。连续 24 小时稳定性尚未通过验证。

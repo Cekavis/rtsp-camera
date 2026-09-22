@@ -1,0 +1,17 @@
+.gradle/
+.kotlin/
+.idea/
+**/build/
+local.properties
+.workbench/
+/artifacts/*
+!/artifacts/.gitkeep
+*.apk
+*.aab
+*.iml
+*.jks
+*.keystore
+__pycache__/
+.pytest_cache/
+.env
+.env.*

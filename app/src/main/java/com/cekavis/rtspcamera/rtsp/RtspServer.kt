@@ -1,11 +1,14 @@
 package com.cekavis.rtspcamera.rtsp
 
+import com.cekavis.rtspcamera.model.AudioCodecConfig
 import com.cekavis.rtspcamera.model.CodecConfig
+import com.cekavis.rtspcamera.model.EncodedAudioFrame
 import com.cekavis.rtspcamera.model.EncodedFrame
 import com.cekavis.rtspcamera.model.RtspCallbacks
 import com.cekavis.rtspcamera.model.ServerConfig
 import com.cekavis.rtspcamera.model.VideoCodec
 import com.pedro.common.frame.MediaFrame
+import com.pedro.rtsp.rtp.packets.AacPacket
 import com.pedro.rtsp.rtp.packets.BasePacket
 import com.pedro.rtsp.rtp.packets.H264Packet
 import com.pedro.rtsp.rtp.packets.H265Packet
@@ -42,7 +45,7 @@ import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Listener lifetime is independent of camera/encoder lifetime. The callbacks own media leases.
- * Only /live, one video track, and RTSP 1.0 PLAY are exposed. No publishing, audio or multicast.
+ * Only /live and RTSP 1.0 PLAY are exposed, with video and optional AAC. No publishing or multicast.
  * Protocol design was checked against pedroSG94/RTSP-Server 1.4.3; see third_party/README.md.
  */
 class RtspServer(private val config: ServerConfig, private val callbacks: RtspCallbacks) {
@@ -122,6 +125,14 @@ class RtspServer(private val config: ServerConfig, private val callbacks: RtspCa
         targets.forEach { it.offer(owned) }
     }
 
+    /** Like video, publishing audio only appends to bounded queues and never writes to a socket. */
+    fun publishAudio(frame: EncodedAudioFrame) {
+        val targets = synchronized(registryLock) { playing.mapNotNull { clients[it] } }
+        if (targets.isEmpty() || frame.data.isEmpty()) return
+        val owned = frame.copy(data = frame.data.copyOf())
+        targets.forEach { it.offerAudio(owned) }
+    }
+
     private fun reservePlayer(clientId: String): Boolean = synchronized(registryLock) {
         if (clientId in playing) true else if (playing.size >= MAX_PLAYERS) false else { playing.add(clientId); true }
     }
@@ -166,31 +177,45 @@ class RtspServer(private val config: ServerConfig, private val callbacks: RtspCa
         private val writer = SocketWriter(socket)
         private val authentication = DigestAuthentication(config.username, config.password)
         private val queue = ClientFrameQueue()
+        private val audioQueue = ClientAudioQueue()
         private val lastActivity = AtomicLong(System.nanoTime())
         private val negotiationDeadline = AtomicLong(System.nanoTime() + NEGOTIATION_NANOS)
-        private var ssrc = SecureRandom().nextInt().toLong() and 0xffff_ffffL
         private val origin = System.currentTimeMillis()
+        private val clock = RtpClock()
+        private val canonicalName = "rtsp-camera-$sessionId"
+        private val videoTrack = Track(90_000)
+        private val audioTrack = Track(48_000)
+        private val tracks = listOf(videoTrack, audioTrack)
         private var clientJob: Job? = null
         private var watchdogJob: Job? = null
-        private var senderJob: Job? = null
-        private var receiverJob: Job? = null
-        @Volatile private var transport: RtpTransport? = null
         @Volatile private var acceptingFrames = false
-        private var requestedTransport: TransportRequest? = null
         private var videoLease = false
+        private var audioLease = false
         private var describedCodec: CodecConfig? = null
-        private var packetizer: BasePacket? = null
+        private var describedAudio: AudioCodecConfig? = null
         private var baseUri = localBaseUri()
-        private var packetCount = 0L
-        private var octetCount = 0L
-        private var lastRtpTimestamp = 0L
-        private var lastReportNanos = 0L
-        private var lastOutputUs = -1L
-        private var lastOutputNanos = 0L
-        private var segmentInputUs: Long? = null
-        private var segmentOutputUs = 0L
         private var congestionSinceNanos = 0L
         private var lastResyncNanos = 0L
+
+        private inner class Track(var clockRate: Int) {
+            var ssrc = SecureRandom().nextInt().toLong() and 0xffff_ffffL
+            @Volatile var transport: RtpTransport? = null
+            var requestedTransport: TransportRequest? = null
+            var packetizer: BasePacket? = null
+            var senderJob: Job? = null
+            var receiverJob: Job? = null
+            var packetCount = 0L
+            var octetCount = 0L
+            var lastReportNanos = 0L
+
+            fun reset() {
+                ssrc = SecureRandom().nextInt().toLong() and 0xffff_ffffL
+                packetizer = null
+                packetCount = 0
+                octetCount = 0
+                lastReportNanos = 0
+            }
+        }
 
         fun start() {
             clientJob = owner.launch {
@@ -216,8 +241,7 @@ class RtspServer(private val config: ServerConfig, private val callbacks: RtspCa
                 } finally {
                     requestClose()
                     withContext(NonCancellable) {
-                        senderJob?.cancelAndJoin()
-                        receiverJob?.cancelAndJoin()
+                        tracks.forEach { it.senderJob?.cancelAndJoin(); it.receiverJob?.cancelAndJoin() }
                         watchdogJob?.cancelAndJoin()
                         releaseLease()
                         synchronized(registryLock) { clients.remove(id); playing.remove(id) }
@@ -232,8 +256,9 @@ class RtspServer(private val config: ServerConfig, private val callbacks: RtspCa
                 acceptingFrames = false
                 state.close()
                 try { socket.close() } catch (_: IOException) { }
-                transport?.close()
+                tracks.forEach { it.transport?.close() }
                 queue.close()
+                audioQueue.close()
                 clientJob?.cancel()
             }
         }
@@ -241,7 +266,7 @@ class RtspServer(private val config: ServerConfig, private val callbacks: RtspCa
         suspend fun join() { clientJob?.join() }
 
         @Synchronized fun offer(frame: EncodedFrame) {
-            if (!acceptingFrames || closed.get()) return
+            if (!acceptingFrames || closed.get() || videoTrack.transport == null) return
             when (queue.offer(frame)) {
                 ClientFrameQueue.Offer.RESYNC_REQUIRED -> {
                     val now = System.nanoTime()
@@ -253,6 +278,10 @@ class RtspServer(private val config: ServerConfig, private val callbacks: RtspCa
                 ClientFrameQueue.Offer.WAITING_FOR_KEYFRAME -> requestKeyframe()
                 ClientFrameQueue.Offer.CLOSED -> Unit
             }
+        }
+
+        fun offerAudio(frame: EncodedAudioFrame) {
+            if (acceptingFrames && !closed.get() && audioTrack.transport != null) audioQueue.offer(frame)
         }
 
         private suspend fun handle(request: RtspRequest) {
@@ -267,8 +296,12 @@ class RtspServer(private val config: ServerConfig, private val callbacks: RtspCa
             try {
                 val path = targetPath(request.target)
                 val isAggregate = path == "/live" || path == "/live/"
-                val isTrack = path == "/live/trackID=0" || path == "/live/streamid=0"
-                if (!isAggregate && !isTrack && !(request.method == "OPTIONS" && path == "*")) {
+                val track = when (path) {
+                    "/live/trackID=0", "/live/streamid=0" -> videoTrack
+                    "/live/trackID=1", "/live/streamid=1" -> audioTrack.takeIf { describedAudio != null }
+                    else -> null
+                }
+                if (!isAggregate && track == null && !(request.method == "OPTIONS" && path == "*")) {
                     respond(request, 404); return
                 }
                 if (request.method !in setOf("OPTIONS", "DESCRIBE", "SETUP") &&
@@ -284,8 +317,8 @@ class RtspServer(private val config: ServerConfig, private val callbacks: RtspCa
                         describe(request)
                     }
                     "SETUP" -> {
-                        if (!isTrack) throw RtspProtocolException(404, "Unknown track")
-                        setup(request)
+                        if (track == null) throw RtspProtocolException(404, "Unknown track")
+                        setup(request, track)
                     }
                     "PLAY" -> {
                         if (!isAggregate) throw RtspProtocolException(455, "Aggregate PLAY required")
@@ -318,36 +351,51 @@ class RtspServer(private val config: ServerConfig, private val callbacks: RtspCa
             }
             beginNegotiation()
             val codec = acquire()
-            val body = codecSdp(codec, socket.localAddress.hostAddress ?: "0.0.0.0", origin)
+            val audio = callbacks.audioConfig()?.let { it.copy(config = it.config.copyOf()) }
+            val body = codecSdp(codec, socket.localAddress.hostAddress ?: "0.0.0.0", origin, audio)
             stopTransport()
             describedCodec = codec
-            ssrc = SecureRandom().nextInt().toLong() and 0xffff_ffffL
-            packetizer = makePacketizer(codec)
-            packetCount = 0
-            octetCount = 0
-            lastOutputUs = -1
-            lastReportNanos = 0
+            describedAudio = audio
+            tracks.forEach { it.reset() }
+            videoTrack.packetizer = makePacketizer(codec)
+            audio?.let {
+                audioTrack.clockRate = it.sampleRate
+                audioTrack.packetizer = AacPacket(1).apply { setAudioInfo(it.sampleRate); setSSRC(audioTrack.ssrc) }
+            }
             baseUri = advertisedBaseUri(request.target)
             state.describe()
             respond(request, 200, mapOf("Content-Type" to "application/sdp", "Content-Base" to "$baseUri/", "Cache-Control" to "no-cache"), body)
         }
 
-        private suspend fun setup(request: RtspRequest) {
+        private suspend fun setup(request: RtspRequest, track: Track) {
             if (state.phase !in setOf(SessionPhase.DESCRIBED, SessionPhase.READY)) throw RtspProtocolException(455, "DESCRIBE required")
             val requested = TransportRequest.parse(request.header("transport"))
-            if (requestedTransport != requested) {
-                stopTransport()
-                transport = if (requested.tcp) RtpTransport.Tcp(requested, writer) else RtpTransport.Udp.open(requested, socket.inetAddress)
-                requestedTransport = requested
-                (transport as? RtpTransport.Udp)?.let(::startRtcpReceiver)
+            if (tracks.any { other ->
+                    other !== track && other.requestedTransport?.let {
+                        it.tcp == requested.tcp && (requested.first in it.first..it.second || requested.second in it.first..it.second)
+                    } == true
+                }) throw RtspProtocolException(461, "Track transports overlap")
+            if (track.requestedTransport != requested) {
+                // Allocate first so failed SETUP does not destroy a previously working track.
+                val replacement = if (requested.tcp) RtpTransport.Tcp(requested, writer) else RtpTransport.Udp.open(requested, socket.inetAddress)
+                try {
+                    track.transport?.close()
+                    track.receiverJob?.cancelAndJoin()
+                    currentCoroutineContext().ensureActive()
+                    track.transport = replacement
+                    track.requestedTransport = requested
+                    track.receiverJob = (replacement as? RtpTransport.Udp)?.let(::startRtcpReceiver)
+                } finally {
+                    if (track.transport !== replacement) replacement.close()
+                }
             }
             state.setup()
-            respond(request, 200, sessionHeader() + ("Transport" to requireNotNull(transport).responseHeader(ssrc)))
+            respond(request, 200, sessionHeader() + ("Transport" to requireNotNull(track.transport).responseHeader(track.ssrc)))
         }
 
         private suspend fun play(request: RtspRequest) {
             if (state.phase !in setOf(SessionPhase.READY, SessionPhase.PAUSED, SessionPhase.PLAYING)) throw RtspProtocolException(455, "SETUP required")
-            if (transport == null) throw RtspProtocolException(455, "SETUP required")
+            if (tracks.none { it.transport != null }) throw RtspProtocolException(455, "SETUP required")
             if (!isLiveNptRange(request.header("range"))) {
                 throw RtspProtocolException(455, "Live stream cannot seek")
             }
@@ -357,28 +405,39 @@ class RtspServer(private val config: ServerConfig, private val callbacks: RtspCa
             if (!reservePlayer(id)) { respond(request, 453, sessionHeader()); return }
             try {
                 beginNegotiation()
-                val currentCodec = acquire()
                 val previous = describedCodec ?: throw RtspProtocolException(455, "DESCRIBE required")
-                if (!previous.sameParameters(currentCodec)) {
+                val videoChanged = if (videoTrack.transport != null) !previous.sameParameters(acquire()) else false
+                val audioChanged = if (audioTrack.transport != null) {
+                    val current = callbacks.audioConfig()
+                    val described = describedAudio
+                    current == null || described == null || current.sampleRate != described.sampleRate ||
+                        current.channels != described.channels || !current.config.contentEquals(described.config)
+                } else false
+                if (videoChanged || audioChanged) {
                     stopTransport()
                     describedCodec = null
-                    packetizer = null
+                    describedAudio = null
+                    tracks.forEach { it.packetizer = null }
                     state.renegotiate()
                     releaseLease()
                     removePlayer(id)
                     respond(request, 455, mapOf("Content-Type" to "text/plain"), "Codec parameters changed. Send DESCRIBE and SETUP again.\n")
                     return
                 }
-                if (packetizer == null) packetizer = makePacketizer(currentCodec)
+                if (videoTrack.transport == null) releaseVideoLease()
+                if (audioTrack.transport != null) acquireAudio()
                 queue.clear()
-                segmentInputUs = null
+                audioQueue.clear()
                 state.play()
                 negotiationDeadline.set(0)
                 acceptingFrames = true
                 // The sender starts after the PLAY response. Queued frames cannot overtake it.
                 respond(request, 200, sessionHeader() + mapOf("Range" to "npt=now-"))
-                senderJob = owner.launch { sendFrames() }
-                requestKeyframe()
+                if (videoTrack.transport != null) {
+                    videoTrack.senderJob = owner.launch { sendFrames() }
+                    requestKeyframe()
+                }
+                if (audioTrack.transport != null) audioTrack.senderJob = owner.launch { sendAudioFrames() }
                 reportCounts()
             } catch (error: Exception) {
                 acceptingFrames = false
@@ -418,6 +477,17 @@ class RtspServer(private val config: ServerConfig, private val callbacks: RtspCa
         }
 
         private suspend fun releaseLease() {
+            withContext(NonCancellable) {
+                if (audioLease) {
+                    audioLease = false
+                    try { callbacks.releaseAudio(id) }
+                    catch (_: Exception) { reportError("无法释放音频采集会话") }
+                }
+                releaseVideoLease()
+            }
+        }
+
+        private suspend fun releaseVideoLease() {
             if (!videoLease) return
             withContext(NonCancellable) {
                 videoLease = false
@@ -426,40 +496,32 @@ class RtspServer(private val config: ServerConfig, private val callbacks: RtspCa
             }
         }
 
+        private suspend fun acquireAudio() {
+            audioLease = true // Release partial initialization if permission/device/encoder startup fails.
+            try { withTimeout(10_000) { callbacks.acquireAudio(id) } }
+            catch (error: CancellationException) {
+                if (!currentCoroutineContext().isActive) throw error
+                releaseLease()
+                throw RtspProtocolException(503, "Microphone start timed out")
+            } catch (_: Exception) {
+                releaseLease()
+                throw RtspProtocolException(503, "Microphone unavailable")
+            }
+        }
+
         private fun makePacketizer(codec: CodecConfig): BasePacket = when (codec.codec) {
             VideoCodec.H264 -> H264Packet(0).apply { sendVideoInfo(ByteBuffer.wrap(codec.sps), ByteBuffer.wrap(codec.pps)) }
             VideoCodec.HEVC -> H265Packet(0).apply {
                 sendVideoInfo(ByteBuffer.wrap(codec.sps), ByteBuffer.wrap(codec.pps), ByteBuffer.wrap(requireNotNull(codec.vps)))
             }
-        }.apply { setSSRC(ssrc) }
+        }.apply { setSSRC(videoTrack.ssrc) }
 
         private suspend fun sendFrames() {
             try {
                 while (currentCoroutineContext().isActive && acceptingFrames && !closed.get()) {
                     val frame = queue.take() ?: break
-                    val now = System.nanoTime()
-                    if (segmentInputUs == null) {
-                        segmentInputUs = frame.presentationTimeUs
-                        segmentOutputUs = if (lastOutputUs < 0) 0 else lastOutputUs + maxOf(1, (now - lastOutputNanos) / 1000)
-                    }
-                    val timestamp = maxOf(lastOutputUs + 1, segmentOutputUs + maxOf(0, frame.presentationTimeUs - requireNotNull(segmentInputUs)))
-                    val media = MediaFrame(ByteBuffer.wrap(frame.data), MediaFrame.Info(0, frame.data.size, timestamp, frame.isKeyFrame), MediaFrame.Type.VIDEO)
-                    requireNotNull(packetizer).createAndSendPacket(media) { packets ->
-                        currentCoroutineContext().ensureActive()
-                        val target = transport ?: return@createAndSendPacket
-                        target.sendRtp(packets.map { if (it.length == it.buffer.size) it.buffer else it.buffer.copyOf(it.length) })
-                        packets.forEach { packet ->
-                            packetCount++
-                            octetCount += maxOf(0, packet.length - 12)
-                            lastRtpTimestamp = packet.timeStamp
-                        }
-                        if (now - lastReportNanos >= 5_000_000_000) {
-                            target.sendRtcp(Rtcp.senderReport(ssrc, lastRtpTimestamp, packetCount, octetCount, System.currentTimeMillis()))
-                            lastReportNanos = now
-                        }
-                    }
-                    lastOutputUs = timestamp
-                    lastOutputNanos = now
+                    val media = MediaFrame(ByteBuffer.wrap(frame.data), MediaFrame.Info(0, frame.data.size, frame.presentationTimeUs, frame.isKeyFrame), MediaFrame.Type.VIDEO)
+                    sendPacket(videoTrack, media)
                 }
             } catch (error: CancellationException) {
                 throw error
@@ -468,44 +530,88 @@ class RtspServer(private val config: ServerConfig, private val callbacks: RtspCa
             }
         }
 
-        private suspend fun stopSender() {
-            acceptingFrames = false
-            senderJob?.cancelAndJoin()
-            senderJob = null
-            queue.clear()
+        private suspend fun sendAudioFrames() {
+            try {
+                while (currentCoroutineContext().isActive && acceptingFrames && !closed.get()) {
+                    val frame = audioQueue.take() ?: break
+                    val media = MediaFrame(ByteBuffer.wrap(frame.data), MediaFrame.Info(0, frame.data.size, frame.presentationTimeUs, false), MediaFrame.Type.AUDIO)
+                    sendPacket(audioTrack, media)
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Exception) {
+                requestClose()
+            }
         }
 
-        private suspend fun stopTransport() {
-            stopSender()
-            transport?.close()
-            transport = null
-            requestedTransport = null
-            receiverJob?.cancelAndJoin()
-            receiverJob = null
-        }
-
-        private fun startRtcpReceiver(udp: RtpTransport.Udp) {
-            receiverJob = owner.launch {
-                val data = ByteArray(16 * 1024)
-                try {
-                    while (isActive && !closed.get()) {
-                        val packet = DatagramPacket(data, data.size)
-                        try { udp.rtcp.receive(packet) } catch (_: SocketTimeoutException) { continue }
-                        val bytes = data.copyOf(packet.length)
-                        if (Rtcp.isValid(bytes)) {
-                            lastActivity.set(System.nanoTime())
-                            if (Rtcp.hasBye(bytes)) { requestClose(); break }
-                        }
+        private suspend fun sendPacket(track: Track, media: MediaFrame) {
+            requireNotNull(track.packetizer).createAndSendPacket(media) { packets ->
+                currentCoroutineContext().ensureActive()
+                val target = track.transport ?: return@createAndSendPacket
+                val buffers = packets.map { if (it.length == it.buffer.size) it.buffer else it.buffer.copyOf(it.length) }
+                if (track === audioTrack) {
+                    // RFC 3640 AU-size is the whole access unit, including when it spans RTP packets.
+                    // RootEncoder 2.8.1 puts fragment size here; keep its framing but correct this field.
+                    buffers.forEach {
+                        it[14] = (media.info.size shr 5).toByte()
+                        it[15] = (media.info.size shl 3).toByte()
                     }
-                } catch (_: IOException) {
-                    // Closing/replacing UDP transport intentionally wakes this receiver.
+                }
+                target.sendRtp(buffers)
+                packets.forEach {
+                    track.packetCount++
+                    track.octetCount += maxOf(0, it.length - 12)
+                }
+                val now = System.nanoTime()
+                if (track.lastReportNanos == 0L || now - track.lastReportNanos >= 5_000_000_000) {
+                    val nowUs = now / 1000
+                    // SR's RTP and NTP timestamps describe the same instant, rather than pairing
+                    // a queued frame's capture time with the wall clock at the moment of sending.
+                    target.sendRtcp(Rtcp.senderReport(track.ssrc, RtpClock.timestamp(nowUs, track.clockRate),
+                        track.packetCount, track.octetCount, clock.wallTimeMillis(nowUs), canonicalName))
+                    track.lastReportNanos = now
                 }
             }
         }
 
+        private suspend fun stopSender() {
+            acceptingFrames = false
+            tracks.forEach { it.senderJob?.cancelAndJoin(); it.senderJob = null }
+            queue.clear()
+            audioQueue.clear()
+        }
+
+        private suspend fun stopTransport() {
+            stopSender()
+            tracks.forEach {
+                it.transport?.close()
+                it.transport = null
+                it.requestedTransport = null
+                it.receiverJob?.cancelAndJoin()
+                it.receiverJob = null
+            }
+        }
+
+        private fun startRtcpReceiver(udp: RtpTransport.Udp): Job = owner.launch {
+            val data = ByteArray(16 * 1024)
+            try {
+                while (isActive && !closed.get()) {
+                    val packet = DatagramPacket(data, data.size)
+                    try { udp.rtcp.receive(packet) } catch (_: SocketTimeoutException) { continue }
+                    val bytes = data.copyOf(packet.length)
+                    if (Rtcp.isValid(bytes)) {
+                        lastActivity.set(System.nanoTime())
+                        if (Rtcp.hasBye(bytes)) { requestClose(); break }
+                    }
+                }
+            } catch (_: IOException) {
+                // Closing/replacing UDP transport intentionally wakes this receiver.
+            }
+        }
+
         private fun handleInterleaved(packet: RtspInput.Interleaved) {
-            val tcp = transport as? RtpTransport.Tcp ?: throw RtspProtocolException(400, "No interleaved transport")
-            if (packet.channel != tcp.request.second || !Rtcp.isValid(packet.data)) throw RtspProtocolException(400, "Invalid RTCP")
+            val knownChannel = tracks.any { (it.transport as? RtpTransport.Tcp)?.request?.second == packet.channel }
+            if (!knownChannel || !Rtcp.isValid(packet.data)) throw RtspProtocolException(400, "Invalid RTCP")
             lastActivity.set(System.nanoTime())
             if (Rtcp.hasBye(packet.data)) requestClose()
         }

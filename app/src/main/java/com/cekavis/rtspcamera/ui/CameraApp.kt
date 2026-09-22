@@ -44,6 +44,7 @@ private const val LOCAL_NETWORK_PERMISSION = "android.permission.ACCESS_LOCAL_NE
 internal fun CameraApp(controller: AppController, activity: Activity) {
     val state by controller.state.collectAsStateWithLifecycle()
     val cameras by controller.cameras.collectAsStateWithLifecycle()
+    val microphones by controller.microphones.collectAsStateWithLifecycle()
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     var visible by remember { mutableStateOf(lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) }
     var settingsOpen by rememberSaveable { mutableStateOf(false) }
@@ -55,14 +56,43 @@ internal fun CameraApp(controller: AppController, activity: Activity) {
     var notificationRequested by rememberSaveable { mutableStateOf(false) }
     var permissionProblem by rememberSaveable { mutableStateOf<String?>(null) }
     var pendingConfig by remember { mutableStateOf<AppConfig?>(null) }
-    val requiredPermissions = remember {
+    var microphoneConfig by remember { mutableStateOf<AppConfig?>(null) }
+    var microphoneDenied by remember { mutableStateOf(false) }
+    val requiredPermissions = remember(state.config.audio.enabled) {
         buildList {
             add(Manifest.permission.CAMERA)
+            if (state.config.audio.enabled) add(Manifest.permission.RECORD_AUDIO)
             if (Build.VERSION.SDK_INT >= 37) add(LOCAL_NETWORK_PERMISSION)
         }
     }
     fun permissionGranted(permission: String) =
         ContextCompat.checkSelfPermission(activity, permission) == PackageManager.PERMISSION_GRANTED
+
+    fun saveConfig(updated: AppConfig) {
+        controller.clearError()
+        controller.applyConfig(updated)
+        settingsOpen = false
+    }
+
+    val microphonePermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        val updated = microphoneConfig
+        microphoneConfig = null
+        permissionStep = "idle"
+        if (granted && updated != null) {
+            permissionProblem = null
+            saveConfig(updated)
+        } else if (!granted) {
+            microphoneDenied = true
+        }
+    }
+
+    fun saveWithAudioPermission(updated: AppConfig) {
+        if (updated.audio.enabled && !permissionGranted(Manifest.permission.RECORD_AUDIO)) {
+            microphoneConfig = updated
+            permissionStep = "microphone-save"
+            microphonePermission.launch(Manifest.permission.RECORD_AUDIO)
+        } else saveConfig(updated)
+    }
 
     val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
         notificationRequested = true
@@ -75,7 +105,9 @@ internal fun CameraApp(controller: AppController, activity: Activity) {
             controller.refreshCapabilities()
         } else {
             startRequested = false
-            permissionProblem = if (Build.VERSION.SDK_INT >= 37 && !permissionGranted(LOCAL_NETWORK_PERMISSION)) {
+            permissionProblem = if (state.config.audio.enabled && !permissionGranted(Manifest.permission.RECORD_AUDIO)) {
+                "需要麦克风权限才能传输声音。可前往应用设置授权，或在音频设置中选择关闭。"
+            } else if (Build.VERSION.SDK_INT >= 37 && !permissionGranted(LOCAL_NETWORK_PERMISSION)) {
                 "需要相机和局域网权限，才能向播放设备提供视频。可重试授权，或前往应用设置开启权限。"
             } else {
                 "需要相机权限才能提供视频。可重试授权，或前往应用设置开启权限。"
@@ -83,7 +115,7 @@ internal fun CameraApp(controller: AppController, activity: Activity) {
         }
     }
 
-    DisposableEffect(lifecycle, controller) {
+    DisposableEffect(lifecycle, controller, requiredPermissions) {
         val observer = LifecycleEventObserver { _, event ->
             when (event) {
                 Lifecycle.Event.ON_START -> visible = true
@@ -119,7 +151,7 @@ internal fun CameraApp(controller: AppController, activity: Activity) {
     }
     LaunchedEffect(
         startRequested, state.loaded, state.config.server.authConfigured, state.applyingSettings,
-        visible, permissionStep, authDialogOpen,
+        visible, permissionStep, authDialogOpen, state.config.audio.enabled,
     ) {
         if (!startRequested || !state.loaded || state.applyingSettings || !visible ||
             !state.config.server.authConfigured || authDialogOpen || permissionStep != "idle"
@@ -167,7 +199,8 @@ internal fun CameraApp(controller: AppController, activity: Activity) {
                 SettingsScreen(
                     config = state.config,
                     cameras = cameras,
-                    applying = state.applyingSettings,
+                    microphones = microphones,
+                    applying = state.applyingSettings || permissionStep != "idle",
                     onBack = { settingsOpen = false },
                     onSave = { updated ->
                         if (updated == state.config) {
@@ -175,9 +208,7 @@ internal fun CameraApp(controller: AppController, activity: Activity) {
                         } else if (state.serviceRunning) {
                             pendingConfig = updated
                         } else {
-                            controller.clearError()
-                            controller.applyConfig(updated)
-                            settingsOpen = false
+                            saveWithAudioPermission(updated)
                         }
                     },
                 )
@@ -239,16 +270,28 @@ internal fun CameraApp(controller: AppController, activity: Activity) {
         AlertDialog(
             onDismissRequest = { pendingConfig = null },
             title = { Text("应用新设置？") },
-            text = { Text("保存设置会重新配置服务并中断当前视频连接，播放设备需要重新连接。") },
+            text = { Text("保存设置会重新配置服务并中断当前音视频连接，播放设备需要重新连接。") },
             confirmButton = {
                 TextButton(onClick = {
                     pendingConfig = null
-                    controller.clearError()
-                    controller.applyConfig(updated)
-                    settingsOpen = false
+                    saveWithAudioPermission(updated)
                 }) { Text("保存并重新配置") }
             },
             dismissButton = { TextButton(onClick = { pendingConfig = null }) { Text("继续编辑") } },
+        )
+    }
+    if (microphoneDenied) {
+        AlertDialog(
+            onDismissRequest = { microphoneDenied = false },
+            title = { Text("需要麦克风权限") },
+            text = { Text("音频设置尚未保存。请在应用权限中允许录音，或返回设置选择关闭音频。") },
+            confirmButton = {
+                TextButton(onClick = {
+                    microphoneDenied = false
+                    openSystemSettings(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${activity.packageName}")))
+                }) { Text("应用权限") }
+            },
+            dismissButton = { TextButton(onClick = { microphoneDenied = false }) { Text("继续编辑") } },
         )
     }
 }

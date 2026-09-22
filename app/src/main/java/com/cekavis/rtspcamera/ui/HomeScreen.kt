@@ -262,6 +262,7 @@ private fun StatusCard(state: AppState, cameras: List<CameraOption>) {
                 Text(
                     when {
                         !state.serviceRunning -> "启动后即可从局域网访问相机。"
+                        state.microphoneActive -> if (state.cameraActive) "相机与麦克风正在采集并传输。" else "麦克风正在采集并传输。"
                         state.cameraActive -> "相机已开启，视频由设备本地处理。"
                         else -> "相机已关闭，有播放需求时自动唤醒。"
                     },
@@ -279,6 +280,7 @@ private fun StatusCard(state: AppState, cameras: List<CameraOption>) {
                     append(cameras.firstOrNull { it.id == state.config.video.cameraId }?.label ?: "相机 ${state.config.video.cameraId}")
                     append(" · ${state.config.video.outputWidth} × ${state.config.video.outputHeight}")
                     append(" · ${state.config.video.fpsLabel} · ${state.config.video.codec.label}")
+                    append(if (state.config.audio.enabled) " · 麦克风音频" else " · 音频关闭")
                     if (state.connectedClients > state.playingClients) append("\n已连接 ${state.connectedClients} 台设备")
                 },
                 style = MaterialTheme.typography.bodySmall,

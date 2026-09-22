@@ -39,7 +39,25 @@ data class AppConfig(
     val video: VideoConfig = VideoConfig(),
     val server: ServerConfig = ServerConfig(),
     val keepScreenOn: Boolean = true,
+    val audio: AudioConfig = AudioConfig(),
 )
+
+enum class AudioSource(val label: String) { OFF("关闭"), MICROPHONE("麦克风") }
+
+data class AudioConfig(val source: AudioSource = AudioSource.OFF, val deviceKey: String? = null) {
+    val enabled get() = source == AudioSource.MICROPHONE
+}
+
+data class MicrophoneOption(val key: String, val label: String)
+
+/** AAC-LC, 48 kHz mono. Raw access units are transported without ADTS headers. */
+data class AudioCodecConfig(
+    val sampleRate: Int = 48_000,
+    val channels: Int = 1,
+    val config: ByteArray = byteArrayOf(0x11, 0x88.toByte()),
+)
+
+data class EncodedAudioFrame(val data: ByteArray, val presentationTimeUs: Long)
 
 data class CaptureMode(val width: Int, val height: Int, val fps: Int, val codec: VideoCodec, val fpsMin: Int = fps) {
     val fpsLabel get() = frameRateLabel(fpsMin, fps)
@@ -57,6 +75,7 @@ data class AppState(
     val connectedClients: Int = 0,
     val playingClients: Int = 0,
     val cameraActive: Boolean = false,
+    val microphoneActive: Boolean = false,
     val previewActive: Boolean = false,
     val actualFps: Float = 0f,
     val actualBitrate: Long = 0,
@@ -86,6 +105,9 @@ data class EncodedFrame(val data: ByteArray, val presentationTimeUs: Long, val i
 interface RtspCallbacks {
     suspend fun acquireVideo(clientId: String): CodecConfig
     suspend fun releaseVideo(clientId: String)
+    fun audioConfig(): AudioCodecConfig? = null
+    suspend fun acquireAudio(clientId: String) = Unit
+    suspend fun releaseAudio(clientId: String) = Unit
     fun requestKeyFrame()
     fun onClientCounts(connected: Int, playing: Int)
     fun onError(message: String)
@@ -94,6 +116,7 @@ interface RtspCallbacks {
 interface AppController {
     val state: StateFlow<AppState>
     val cameras: StateFlow<List<CameraOption>>
+    val microphones: StateFlow<List<MicrophoneOption>>
     fun startService()
     fun stopService()
     fun applyConfig(config: AppConfig)

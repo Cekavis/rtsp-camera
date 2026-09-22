@@ -55,6 +55,8 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import com.cekavis.rtspcamera.model.AppConfig
+import com.cekavis.rtspcamera.model.AudioSource
+import com.cekavis.rtspcamera.model.MicrophoneOption
 import com.cekavis.rtspcamera.model.CameraOption
 import com.cekavis.rtspcamera.model.CaptureMode
 import com.cekavis.rtspcamera.model.VideoCodec
@@ -65,11 +67,13 @@ import kotlin.math.abs
 internal fun SettingsScreen(
     config: AppConfig,
     cameras: List<CameraOption>,
+    microphones: List<MicrophoneOption>,
     applying: Boolean,
     onBack: () -> Unit,
     onSave: (AppConfig) -> Unit,
 ) {
     var video by remember(config) { mutableStateOf(config.video) }
+    var audio by remember(config) { mutableStateOf(config.audio) }
     var port by remember(config) { mutableStateOf(config.server.port.toString()) }
     var bitrateKbps by remember(config) { mutableStateOf((config.video.bitrate / 1000).toString()) }
     var authEnabled by remember(config) { mutableStateOf(config.server.authEnabled) }
@@ -97,7 +101,8 @@ internal fun SettingsScreen(
         it.width == video.width && it.height == video.height && it.fpsMin == video.fpsMin &&
             it.fps == video.fps && it.codec == video.codec
     }
-    val valid = parsedPort != null && parsedBitrate != null && modeValid && (!authEnabled || (usernameValid && passwordValid))
+    val microphoneAvailable = !audio.enabled || audio.deviceKey == null || microphones.any { it.key == audio.deviceKey }
+    val valid = parsedPort != null && parsedBitrate != null && modeValid && microphoneAvailable && (!authEnabled || (usernameValid && passwordValid))
 
     fun selectMode(requested: VideoConfig, camera: CameraOption) {
         val supported = fitVideoToCamera(requested, camera)
@@ -117,6 +122,7 @@ internal fun SettingsScreen(
             authConfigured = config.server.authConfigured || authChoiceMade,
         ),
         keepScreenOn = keepScreenOn,
+        audio = audio,
     )
 
     Scaffold(
@@ -185,6 +191,29 @@ internal fun SettingsScreen(
                             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                             singleLine = true,
                         )
+                    }
+                }
+                item {
+                    SettingsSection("音频", "仅在客户端播放音频时使用麦克风，本机预览不采集声音。") {
+                        ChoiceField(
+                            label = "音频来源", value = audio.source,
+                            options = AudioSource.entries.map { it to it.label },
+                            fallback = audio.source.label, onChange = { audio = audio.copy(source = it) },
+                        )
+                        if (audio.enabled) {
+                            ChoiceField(
+                                label = "麦克风", value = audio.deviceKey,
+                                options = listOf<String?>(null).map { it to "系统默认麦克风" } +
+                                    microphones.map { it.key to it.label },
+                                fallback = "所选麦克风未连接", onChange = { audio = audio.copy(deviceKey = it) },
+                            )
+                            if (!microphoneAvailable) {
+                                Text("所选麦克风不可用，请重新连接或选择其他来源。", color = MaterialTheme.colorScheme.error,
+                                    style = MaterialTheme.typography.bodySmall)
+                            }
+                            Text("需要麦克风权限。AAC 音频随 RTSP 视频一起传输。", style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
                     }
                 }
                 item {

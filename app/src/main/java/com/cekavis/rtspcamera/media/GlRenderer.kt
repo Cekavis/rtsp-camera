@@ -8,6 +8,7 @@ import android.graphics.SurfaceTexture
 import android.opengl.*
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.SystemClock
 import android.util.Log
 import android.view.Surface
 import com.cekavis.rtspcamera.BuildConfig
@@ -30,6 +31,7 @@ class GlRenderer(
     private val battery: () -> Int,
     private val onFrameRendered: () -> Unit,
     private val onError: (Throwable) -> Unit,
+    private val sensorTimestampRealtime: Boolean = false,
 ) {
     private val thread = HandlerThread("camera-gl").apply { start() }
     private val handler = Handler(thread.looper)
@@ -50,6 +52,10 @@ class GlRenderer(
     private var cameraSurface: Surface? = null
     private var stopped = false
     private var lastFrameNs = 0L
+    // Camera REALTIME timestamps use the boot clock; AudioRecord uses CLOCK_MONOTONIC.
+    // Unknown camera clocks are anchored on their first delivered frame.
+    private var sensorClockOffsetNs: Long? = if (sensorTimestampRealtime)
+        System.nanoTime() - SystemClock.elapsedRealtimeNanos() else null
     private var geometryLogged = false
     private val framePacer = FramePacer(config.fps)
     private var overlaySecond = Long.MIN_VALUE
@@ -117,7 +123,9 @@ class GlRenderer(
             makeCurrent(offscreen)
             val st = surfaceTexture ?: return
             st.updateTexImage()
-            val timestamp = st.timestamp.takeIf { it > 0 } ?: System.nanoTime()
+            val timestamp = st.timestamp.takeIf { it > 0 } ?:
+                if (sensorTimestampRealtime) SystemClock.elapsedRealtimeNanos() else System.nanoTime()
+            if (sensorClockOffsetNs == null) sensorClockOffsetNs = System.nanoTime() - timestamp
             if (!framePacer.shouldRender(timestamp)) return
             lastFrameNs = max(timestamp, lastFrameNs + 1)
             st.getTransformMatrix(producerMatrix)
@@ -130,7 +138,7 @@ class GlRenderer(
             if (encoderWindow != EGL14.EGL_NO_SURFACE) {
                 makeCurrent(encoderWindow)
                 draw(config.outputWidth, config.outputHeight)
-                EGLExt.eglPresentationTimeANDROID(display, encoderWindow, lastFrameNs)
+                EGLExt.eglPresentationTimeANDROID(display, encoderWindow, lastFrameNs + requireNotNull(sensorClockOffsetNs))
                 check(EGL14.eglSwapBuffers(display, encoderWindow)) { "编码输入画面提交失败" }
             }
             if (previewWindow != EGL14.EGL_NO_SURFACE && previewSurface?.isValid == true) {

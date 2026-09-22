@@ -74,13 +74,20 @@ internal fun decodeSettings(raw: String, decryptCredential: (String) -> String):
         ),
         server = ServerConfig(server.getInt("port"), server.getBoolean("auth"), server.getString("user"), password, server.getBoolean("configured")),
         keepScreenOn = json.getBoolean("keepScreenOn"),
+        audio = json.optJSONObject("audio")?.let { audio ->
+            AudioConfig(
+                source = AudioSource.valueOf(audio.getString("source")),
+                deviceKey = audio.optString("device").takeIf { it.isNotEmpty() },
+            )
+        } ?: AudioConfig(),
     )
 }
 
 internal fun encodeSettings(config: AppConfig, encryptCredential: (String) -> String): String {
     val video = config.video
     val server = config.server
-    return JSONObject().put("version", 2).put("keepScreenOn", config.keepScreenOn)
+    return JSONObject().put("version", 3).put("keepScreenOn", config.keepScreenOn)
+        .put("audio", JSONObject().put("source", config.audio.source.name).put("device", config.audio.deviceKey.orEmpty()))
         .put("video", JSONObject().put("camera", video.cameraId).put("width", video.width).put("height", video.height)
             .put("fps", video.fps).put("fpsMin", video.fpsMin).put("bitrate", video.bitrate)
             .put("codec", video.codec.name).put("rotation", video.rotation)

@@ -13,6 +13,7 @@ import androidx.core.app.NotificationCompat
 import com.cekavis.rtspcamera.CameraApplication
 import com.cekavis.rtspcamera.R
 import com.cekavis.rtspcamera.media.MediaPipeline
+import com.cekavis.rtspcamera.media.AudioPipeline
 import com.cekavis.rtspcamera.model.*
 import com.cekavis.rtspcamera.rtsp.RtspServer
 import com.cekavis.rtspcamera.ui.MainActivity
@@ -27,6 +28,7 @@ class CameraService : Service() {
     private val mutex = Mutex()
     private val graph get() = (application as CameraApplication).controller
     @Volatile private var pipeline: MediaPipeline? = null
+    @Volatile private var audioPipeline: AudioPipeline? = null
     @Volatile private var server: RtspServer? = null
     @Volatile private var previewTarget: Triple<Surface, Int, Int>? = null
     private var config = AppConfig()
@@ -36,6 +38,7 @@ class CameraService : Service() {
     private var ticker: Job? = null
     private var networkJob: Job? = null
     private var startedAt = 0L
+    private var foregroundAudioEnabled: Boolean? = null
     private var currentAddresses = emptyList<String>()
     private val frames = AtomicLong()
     private val bytes = AtomicLong()
@@ -67,8 +70,7 @@ class CameraService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == STOP) { requestStop(); return START_NOT_STICKY }
         try {
-            if (Build.VERSION.SDK_INT >= 30) startForeground(NOTIFICATION_ID, notification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA)
-            else startForeground(NOTIFICATION_ID, notification())
+            updateForeground(graph.state.value.config.audio.enabled)
         } catch (_: Exception) {
             graph.error("系统未允许恢复相机服务，请打开应用后重新启动")
             stopSelf(); return START_NOT_STICKY
@@ -98,13 +100,21 @@ class CameraService : Service() {
     }
 
     private suspend fun startStack(newConfig: AppConfig) {
+        graph.validateAudio(newConfig.audio)
+        withContext(Dispatchers.Main) { updateForeground(newConfig.audio.enabled) }
+        val newAudioPipeline = AudioPipeline(this, newConfig.audio,
+            onFrame = { frame -> bytes.addAndGet(frame.data.size.toLong()); server?.publishAudio(frame) },
+            onActive = { active -> graph.update { old -> old.copy(microphoneActive = active,
+                phase = if (active || old.cameraActive) StreamPhase.STREAMING else StreamPhase.IDLE) } },
+            onFailure = { reason -> recoverPipeline(reason) })
+        audioPipeline = newAudioPipeline
         val newPipeline = MediaPipeline(this, newConfig.video, graph.capabilities,
             battery = { graph.state.value.batteryPercent },
             onFrame = { frame -> bytes.addAndGet(frame.data.size.toLong()); server?.publish(frame) },
             onFrameRendered = { frames.incrementAndGet() },
             onActive = { active, preview, opening -> graph.update { old ->
                 old.copy(cameraActive = active, previewActive = preview,
-                    phase = when { opening -> StreamPhase.STARTING; active -> StreamPhase.STREAMING; else -> StreamPhase.IDLE })
+                    phase = when { opening -> StreamPhase.STARTING; active || old.microphoneActive -> StreamPhase.STREAMING; else -> StreamPhase.IDLE })
             } },
             onFailure = { reason -> recoverPipeline(reason) })
         pipeline = newPipeline
@@ -118,6 +128,13 @@ class CameraService : Service() {
                 throw error
             }
             override suspend fun releaseVideo(clientId: String) { newPipeline.release(clientId) }
+            override fun audioConfig(): AudioCodecConfig? = if (newConfig.audio.enabled) AudioCodecConfig() else null
+            override suspend fun acquireAudio(clientId: String) {
+                try { newAudioPipeline.acquire(clientId) }
+                catch (error: CancellationException) { throw error }
+                catch (error: Exception) { graph.error(error.message ?: "麦克风无法启动"); throw error }
+            }
+            override suspend fun releaseAudio(clientId: String) { newAudioPipeline.release(clientId) }
             override fun requestKeyFrame() = newPipeline.requestKeyFrame()
             override fun onClientCounts(connected: Int, playing: Int) {
                 graph.update { it.copy(connectedClients = connected, playingClients = playing) }
@@ -136,10 +153,14 @@ class CameraService : Service() {
     private suspend fun stopStack() {
         val oldServer = server; server = null
         val oldPipeline = pipeline; pipeline = null
+        val oldAudioPipeline = audioPipeline; audioPipeline = null
         try { oldServer?.stop() }
         finally {
             try { oldPipeline?.close() }
-            finally { frames.set(0); bytes.set(0) }
+            finally {
+                try { oldAudioPipeline?.close() }
+                finally { frames.set(0); bytes.set(0) }
+            }
         }
     }
 
@@ -150,7 +171,7 @@ class CameraService : Service() {
             ticker?.cancel()
             releaseWakeLock()
             graph.update { it.copy(serviceRunning = false, phase = StreamPhase.ERROR, cameraActive = false,
-                previewActive = false, connectedClients = 0, playingClients = 0,
+                microphoneActive = false, previewActive = false, connectedClients = 0, playingClients = 0,
                 actualFps = 0f, actualBitrate = 0, error = message) }
         }
     }
@@ -158,8 +179,11 @@ class CameraService : Service() {
     suspend fun replaceConfig(newConfig: AppConfig) = mutex.withLock {
         if (!running || stopping) return@withLock
         val old = config
-        stopStack()
-        try { startStack(newConfig) } catch (error: Exception) {
+        // Enable the microphone service type while the settings Activity is still visible.
+        // A permission failure must leave the current stream running.
+        graph.validateAudio(newConfig.audio)
+        if (newConfig.audio.enabled) withContext(Dispatchers.Main) { updateForeground(true) }
+        try { stopStack(); startStack(newConfig) } catch (error: Exception) {
             stopStack()
             try { startStack(old) } catch (_: Exception) {
                 failStack("无法恢复原配置，请检查相机状态后重新启动服务")
@@ -245,7 +269,7 @@ class CameraService : Service() {
                 running = false
                 releaseWakeLock()
                 graph.update { it.copy(serviceRunning = false, phase = StreamPhase.STOPPED, cameraActive = false,
-                    previewActive = false, connectedClients = 0, playingClients = 0, actualFps = 0f, actualBitrate = 0,
+                    microphoneActive = false, previewActive = false, connectedClients = 0, playingClients = 0, actualFps = 0f, actualBitrate = 0,
                     uptimeSeconds = 0) }
                 withContext(Dispatchers.Main) { stopForeground(STOP_FOREGROUND_REMOVE); stopSelf() }
             }
@@ -260,13 +284,25 @@ class CameraService : Service() {
     }
     private fun releaseWakeLock() { wakeLock?.takeIf { it.isHeld }?.release(); wakeLock = null }
 
+    private fun updateForeground(audioEnabled: Boolean) {
+        if (foregroundAudioEnabled == audioEnabled) return
+        if (Build.VERSION.SDK_INT >= 30) {
+            val types = ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA or
+                if (audioEnabled) ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE else 0
+            startForeground(NOTIFICATION_ID, notification(), types)
+        } else startForeground(NOTIFICATION_ID, notification())
+        foregroundAudioEnabled = audioEnabled
+    }
+
     private fun notificationText(): String {
         val state = graph.state.value
         return when {
             state.phase == StreamPhase.STARTING -> "正在启动相机"
-            state.cameraActive -> "相机运行中 · ${state.playingClients} 个客户端" + if (state.previewActive) " · 本机预览" else ""
+            state.cameraActive -> "相机运行中 · ${state.playingClients} 个客户端" +
+                (if (state.microphoneActive) " · 麦克风采集中" else "") + (if (state.previewActive) " · 本机预览" else "")
+            state.microphoneActive -> "麦克风传输中 · ${state.playingClients} 个客户端"
             state.phase == StreamPhase.ERROR -> "服务需要处理 · 打开应用查看"
-            else -> "监听待机 · 相机已关闭"
+            else -> "监听待机 · 相机与麦克风已关闭"
         }
     }
 
@@ -287,7 +323,7 @@ class CameraService : Service() {
             mutex.withLock {
                 stopStack(); releaseWakeLock()
                 if (graph.service == null) graph.update { it.copy(serviceRunning = false, phase = StreamPhase.STOPPED,
-                    cameraActive = false, previewActive = false, connectedClients = 0, playingClients = 0,
+                    cameraActive = false, microphoneActive = false, previewActive = false, connectedClients = 0, playingClients = 0,
                     actualFps = 0f, actualBitrate = 0) }
             }
             scope.cancel()

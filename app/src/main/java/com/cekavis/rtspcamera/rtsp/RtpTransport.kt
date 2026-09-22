@@ -1,5 +1,6 @@
 package com.cekavis.rtspcamera.rtsp
 
+import com.cekavis.rtspcamera.model.AudioCodecConfig
 import com.cekavis.rtspcamera.model.CodecConfig
 import com.cekavis.rtspcamera.model.VideoCodec
 import kotlinx.coroutines.sync.Mutex
@@ -116,9 +117,11 @@ internal object Rtcp {
         return false
     }
 
-    /** RFC 3550 compound SR + SDES. Each client's SSRC, counters, and RTP timeline are independent. */
-    fun senderReport(ssrc: Long, rtpTimestamp: Long, packets: Long, octets: Long, nowMillis: Long): ByteArray {
-        val cname = "rtsp-camera-${ssrc.toString(16)}".toByteArray(Charsets.US_ASCII)
+    /** RFC 3550 compound SR + SDES. Related audio/video SSRCs must share a CNAME. */
+    fun senderReport(ssrc: Long, rtpTimestamp: Long, packets: Long, octets: Long, nowMillis: Long,
+                     canonicalName: String = "rtsp-camera-${ssrc.toString(16)}"): ByteArray {
+        val cname = canonicalName.toByteArray(Charsets.US_ASCII)
+        require(cname.size in 1..255)
         val sdesSize = ((4 + 4 + 2 + cname.size + 1 + 3) / 4) * 4
         val buffer = ByteBuffer.allocate(28 + sdesSize).order(ByteOrder.BIG_ENDIAN)
         buffer.put(0x80.toByte()).put(200.toByte()).putShort(6)
@@ -132,7 +135,7 @@ internal object Rtcp {
     }
 }
 
-internal fun codecSdp(config: CodecConfig, address: String, origin: Long): String {
+internal fun codecSdp(config: CodecConfig, address: String, origin: Long, audio: AudioCodecConfig? = null): String {
     val sps = withoutStartCode(config.sps)
     val pps = withoutStartCode(config.pps)
     if (sps.isEmpty() || pps.isEmpty()) throw RtspProtocolException(503, "Codec configuration unavailable")
@@ -149,11 +152,33 @@ internal fun codecSdp(config: CodecConfig, address: String, origin: Long): Strin
             "a=rtpmap:96 H265/90000\r\na=fmtp:96 sprop-vps=${base64.encodeToString(vps)};sprop-sps=${base64.encodeToString(sps)};sprop-pps=${base64.encodeToString(pps)}\r\n"
         }
     }
+    val audioDescription = audio?.let {
+        if (it.sampleRate <= 0 || it.channels !in 1..7 || it.config.isEmpty()) {
+            throw RtspProtocolException(503, "Audio configuration unavailable")
+        }
+        val audioConfig = it.config.joinToString("") { byte -> "%02x".format(byte.toInt() and 0xff) }
+        "m=audio 0 RTP/AVP 97\r\na=rtpmap:97 MPEG4-GENERIC/${it.sampleRate}/${it.channels}\r\n" +
+            "a=fmtp:97 streamtype=5;profile-level-id=1;mode=AAC-hbr;config=$audioConfig;" +
+            "SizeLength=13;IndexLength=3;IndexDeltaLength=3\r\na=control:trackID=1\r\na=sendonly\r\n"
+    }.orEmpty()
     val ipFamily = if (address.contains(':')) "IP6" else "IP4"
     return "v=0\r\no=- $origin ${config.generation} IN $ipFamily $address\r\ns=RTSP Camera\r\n" +
         "c=IN $ipFamily $address\r\nt=0 0\r\na=control:*\r\na=range:npt=0-\r\n" +
         "m=video 0 RTP/AVP 96\r\n$format" +
-        "a=framesize:96 ${config.width}-${config.height}\r\na=control:trackID=0\r\na=sendonly\r\n"
+        "a=framesize:96 ${config.width}-${config.height}\r\na=control:trackID=0\r\na=sendonly\r\n" + audioDescription
+}
+
+/** Capture timestamps and both RTCP clock mappings use the same monotonic timebase. */
+internal class RtpClock(
+    private val anchorUs: Long = System.nanoTime() / 1000,
+    private val anchorMillis: Long = System.currentTimeMillis(),
+) {
+    fun wallTimeMillis(monotonicUs: Long): Long = anchorMillis + (monotonicUs - anchorUs) / 1000
+
+    companion object {
+        fun timestamp(monotonicUs: Long, rate: Int): Long =
+            ((monotonicUs / 1_000_000) * rate + (monotonicUs % 1_000_000) * rate / 1_000_000) and 0xffff_ffffL
+    }
 }
 
 internal fun withoutStartCode(bytes: ByteArray): ByteArray = when {

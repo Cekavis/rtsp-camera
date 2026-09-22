@@ -106,7 +106,9 @@ class MediaPipeline(
             val naturalLandscape = if (sensor % 180 == 90) 90 else 0
             val base = if (characteristics.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_FRONT)
                 (sensor + naturalLandscape) % 360 else (sensor - naturalLandscape + 360) % 360
-            val renderer = GlRenderer(config, base, battery, onFrameRendered, ::reportFailure)
+            val renderer = GlRenderer(config, base, battery, onFrameRendered, ::reportFailure,
+                sensorTimestampRealtime = characteristics.get(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE) ==
+                    CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME)
             gl = renderer
             val surface = renderer.start()
             if (encoding) startEncoder(renderer)
@@ -156,6 +158,14 @@ class MediaPipeline(
             override fun onVideoFormat(mediaFormat: MediaFormat) = Unit
         }) {
             override fun chooseEncoder(mime: String): MediaCodecInfo = selected
+            override fun checkBuffer(byteBuffer: ByteBuffer, bufferInfo: MediaCodec.BufferInfo): Boolean {
+                // Preserve the shared capture clock after RootEncoder checks codec data and
+                // monotonicity. Rebasing each encoder separately loses the A/V start offset.
+                val captureTimeUs = bufferInfo.presentationTimeUs
+                val valid = super.checkBuffer(byteBuffer, bufferInfo)
+                bufferInfo.presentationTimeUs = captureTimeUs
+                return valid
+            }
         }
         encoder = instance
         instance.type = if (config.codec == VideoCodec.HEVC) com.pedro.common.VideoCodec.H265 else com.pedro.common.VideoCodec.H264

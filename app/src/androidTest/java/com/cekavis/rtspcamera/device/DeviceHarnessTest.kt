@@ -23,6 +23,8 @@ import com.cekavis.rtspcamera.CameraApplication
 import com.cekavis.rtspcamera.model.AppConfig
 import com.cekavis.rtspcamera.model.AppController
 import com.cekavis.rtspcamera.model.AppState
+import com.cekavis.rtspcamera.model.AudioConfig
+import com.cekavis.rtspcamera.model.AudioSource
 import com.cekavis.rtspcamera.model.VideoCodec
 import com.cekavis.rtspcamera.ui.MainActivity
 import com.cekavis.rtspcamera.service.CameraService
@@ -37,7 +39,7 @@ import java.util.Locale
 
 /**
  * Device-only harness. Run one method at a time; never supply user credentials in runner arguments.
- * Supported arguments: codec=H264|HEVC, cameraId, width, height, fps, fpsMin, rotation, mirror, time, battery, auth.
+ * Supported arguments: codec=H264|HEVC, cameraId, width, height, fps, fpsMin, rotation, mirror, time, battery, auth, port, audio=OFF|MICROPHONE.
  * preserveOtherSettings=true changes only specified video fields and never changes credentials/authentication.
  * Instrumentation.finish() terminates the app process, so external playback should normally use
  * configureOnlyForExternalPlayback followed by a normal launcher/UI service start.
@@ -242,6 +244,7 @@ class DeviceHarnessTest {
         val context = instrumentation.targetContext
         val required = buildList {
             add(Manifest.permission.CAMERA)
+            if (InstrumentationRegistry.getArguments().getString("audio") == "MICROPHONE") add(Manifest.permission.RECORD_AUDIO)
             if (Build.VERSION.SDK_INT >= 37) add("android.permission.ACCESS_LOCAL_NETWORK")
         }
         required.forEach { permission ->
@@ -283,6 +286,7 @@ class DeviceHarnessTest {
         require(rotation in setOf(0, 90, 180, 270)) { "rotation 只支持 0、90、180、270" }
         val auth = booleanArgument(arguments, "auth", false)
         return original.copy(
+            audio = arguments.getString("audio")?.let { AudioConfig(AudioSource.valueOf(it)) } ?: original.audio,
             video = original.video.copy(
                 cameraId = selected.first.id, width = width, height = height, fps = fps, fpsMin = fpsMin, codec = codec,
                 rotation = rotation,
@@ -290,12 +294,12 @@ class DeviceHarnessTest {
                 showTimestamp = booleanArgument(arguments, "time", preserve && original.video.showTimestamp),
                 showBattery = booleanArgument(arguments, "battery", preserve && original.video.showBattery),
             ),
-            server = if (preserve) original.server else original.server.copy(
+            server = (if (preserve) original.server else original.server.copy(
                 authConfigured = true,
                 authEnabled = auth,
                 username = if (auth) HARNESS_USERNAME else "camera",
                 password = if (auth) temporaryHarnessPassword() else "",
-            ),
+            )).copy(port = integerArgument(arguments, "port", original.server.port)),
         )
     }
 

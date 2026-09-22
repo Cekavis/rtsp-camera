@@ -34,7 +34,7 @@ class SettingsFrameRateMigrationTest {
         val original = configured(fps = 30, fpsMin = 5)
         val serialized = encodeSettings(original, ::encryptSyntheticCredential)
         val json = JSONObject(serialized)
-        assertEquals(2, json.getInt("version"))
+        assertEquals(3, json.getInt("version"))
         assertEquals(5, json.getJSONObject("video").getInt("fpsMin"))
         assertEquals(30, json.getJSONObject("video").getInt("fps"))
         assertFalse("序列化结果不能包含明文凭据", serialized.contains(original.server.password))
